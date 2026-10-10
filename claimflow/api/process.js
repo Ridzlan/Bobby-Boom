@@ -121,7 +121,7 @@ ${String(prompt || '').slice(0, 1000)}
                         responseMimeType: 'application/json'
                     }
                 }),
-                signal: AbortSignal.timeout(45000)
+                signal: AbortSignal.timeout(180000)
             }
         );
 
