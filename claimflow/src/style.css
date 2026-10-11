@@ -1224,3 +1224,42 @@ button {
 .metric strong {
     font-variant-numeric: tabular-nums
 }
+
+.manager-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 14px
+}
+
+    .manager-actions .btn {
+        flex: 1
+    }
+
+.panel .detail-row .btn {
+    margin-top: 7px;
+    min-height: 32px;
+    font-size: 10px
+}
+
+.manager-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 15px
+}
+
+    .manager-actions .btn {
+        flex: 1
+    }
+
+        .manager-actions .btn.secondary {
+            background: #fff0f0;
+            color: #bf3d4b
+        }
+
+.receipt-row {
+    flex-wrap: wrap
+}
+
+.metric strong {
+    font-size: 13px
+}
