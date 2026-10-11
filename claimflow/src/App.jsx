@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Home, ClipboardList, UserRound, ArrowLeft, ArrowRight, FolderOpen, FileText, CheckCircle2, AlertTriangle, ShieldCheck, Mail, Copy, Download, Play, Clock, ChevronRight, ReceiptText, Info, LoaderCircle, Check, X, Bot, Camera, Send, RefreshCw } from 'lucide-react';
 import './style.css';
 import { supabase, configured } from './supabase.js';
-import { getMemberships, getCloudClaims, createDraft, finalizeAndSubmit, managerClaims, managerDecide, receiptSignedUrl } from './cloud.js';
+import { getMemberships, getCloudClaims, createDraft, deleteFailedDraft, finalizeAndSubmit, managerClaims, managerDecide, receiptSignedUrl } from './cloud.js';
 import { suggestExpense } from './suggestions.js';
 const money = (n, c = 'MYR') => { try { return new Intl.NumberFormat('en-MY', { style: 'currency', currency: c }).format(Number(n || 0)) } catch { return `RM ${Number(n || 0).toFixed(2)}` } };
 const statusLabel = s => ({ draft: 'Processing / Saved', submitted: 'Pending Manager', approved: 'Approved by Manager', rejected: 'Rejected', needs_changes: 'Needs Changes' }[s] || s);
@@ -23,13 +23,89 @@ export default function App() {
     async function signIn(e) { e.preventDefault(); setAuthError(''); const { error } = await supabase.auth.signInWithPassword({ email, password }); if (error) setAuthError(error.message) }
     function addFiles(input) { const incoming = Array.from(input || []); const valid = incoming.filter(f => /\.(png|jpe?g|pdf)$/i.test(f.name) && f.size > 0 && f.size <= 10 * 1024 * 1024); setFiles(old => [...old, ...valid].slice(0, 5)); setError(valid.length !== incoming.length || incoming.length + files.length > 5 ? 'Maximum 5 JPG, PNG or PDF files, each under 10 MB.' : '') }
     async function process() {
-        if (!files.length || !orgId || busy) return; setBusy(true); setError(''); setJob(null); setClaimId(''); setClaimStatus(''); go('processing'); let savedId = ''; try {
-            setPhase('Saving original photos to Supabase before AI processing'); const draft = await createDraft(orgId, session.user.id, files); savedId = draft.claimId; setClaimId(savedId);
-            setPhase('Reading receipts with Gemini'); const payload = await Promise.all(files.map(f => new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve({ name: f.name, base64: String(reader.result).split(',')[1] }); reader.onerror = () => reject(Error('Unable to read ' + f.name)); reader.readAsDataURL(f) })));
-            const response = await fetch('/api/process', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: payload, prompt }) }); const data = await response.json(); if (!response.ok) throw Error(data.error || 'Gemini extraction failed'); if (data.job?.status !== 'completed') throw Error('Gemini did not complete the extraction'); setJob(data.job);
-            setPhase('Saving extracted details and submitting to manager'); const extracted = data.job.receipt.receipts; const byName = new Map(extracted.map(r => [r.sourceFile, r])); const ordered = draft.uploaded.map(u => byName.get(u.name)); if (ordered.some(x => !x)) throw Error('Receipt filenames did not match uploaded files');
-            const categorized = ordered.map(r => ({ ...r, expenseCategory: r.expenseCategory && r.expenseCategory !== 'Other' ? r.expenseCategory : suggestExpense(r).category })); const result = await finalizeAndSubmit(savedId, draft.uploaded, categorized); setClaimStatus(result); await refresh(); go('results');
-        } catch (e) { setError(e.message + (savedId ? ' Original receipt files remain saved under draft claim ' + savedId + '.' : '')); await refresh() } finally { setBusy(false) }
+        if (!files.length || !orgId || busy) return;
+        setBusy(true); setError(''); setJob(null); setClaimId(''); setClaimStatus('');
+        go('processing');
+        let savedId = '';
+        let uploaded = [];
+        let submitted = false;
+        try {
+            setPhase('Saving original photos to Supabase before AI processing');
+            const draft = await createDraft(orgId, session.user.id, files);
+            savedId = draft.claimId;
+            uploaded = draft.uploaded;
+            setClaimId(savedId);
+
+            // Process ONE image per request to avoid exceeding Vercel's
+            // aggregate request-size limit with several receipt photos.
+            const extracted = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                setPhase(`Reading receipt ${i + 1} of ${files.length} with Gemini`);
+                const payload = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve({ name: file.name, base64: String(reader.result).split(',')[1] });
+                    reader.onerror = () => reject(Error('Unable to read ' + file.name));
+                    reader.readAsDataURL(file);
+                });
+                const response = await fetch('/api/process', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ files: [payload], prompt })
+                });
+                // Vercel may return plain text for HTTP 413 instead of JSON.
+                const responseText = await response.text();
+                let data;
+                try { data = JSON.parse(responseText); }
+                catch {
+                    if (response.status === 413 || /Request Entity Too Large/i.test(responseText)) {
+                        throw Error(`Receipt ${i + 1} (${file.name}) is too large for AI processing. Try a smaller image.`);
+                    }
+                    throw Error(`Receipt ${i + 1} processing returned an invalid response (HTTP ${response.status}).`);
+                }
+                if (!response.ok) throw Error(data?.error || `Receipt ${i + 1} processing failed (HTTP ${response.status}).`);
+                const oneReceipt = data.job?.receipt?.receipts;
+                if (data.job?.status !== 'completed' || !Array.isArray(oneReceipt) || oneReceipt.length !== 1) {
+                    throw Error(`Gemini could not extract receipt ${i + 1} (${file.name}).`);
+                }
+                // Keep the original selected-file order, including duplicate filenames.
+                extracted.push({ ...oneReceipt[0], sourceFile: file.name });
+            }
+            setJob({ status: 'completed', receipt: { receipts: extracted } });
+
+            setPhase('Saving extracted details and submitting to manager');
+            const categorized = extracted.map(r => ({
+                ...r,
+                expenseCategory: r.expenseCategory && r.expenseCategory !== 'Other'
+                    ? r.expenseCategory : suggestExpense(r).category
+            }));
+            const result = await finalizeAndSubmit(savedId, uploaded, categorized);
+            submitted = true;
+            setClaimStatus(result);
+            await refresh();
+            go('results');
+        } catch (e) {
+            if (savedId && !submitted) {
+                setPhase('Processing failed. Cleaning up this failed draft and its original files…');
+                try {
+                    await deleteFailedDraft(savedId, uploaded);
+                    setClaimId('');
+                    setFiles([]);
+                    setJob(null);
+                    setError(`Unable to process receipt(s): ${e.message} The failed upload and draft were deleted. You can try again.`);
+                } catch (cleanupError) {
+                    setError(`Unable to process receipt(s): ${e.message} Automatic cleanup was NOT completed for draft ${savedId}: ${cleanupError.message}. Do not re-upload until you check this draft.`);
+                }
+            } else if (submitted) {
+                // A refresh error must never cause the now-submitted claim to be deleted.
+                setError(`Your claim was submitted, but updating the screen failed: ${e.message}. Check Claim History.`);
+            } else {
+                setError(e.message);
+            }
+            await refresh();
+        } finally {
+            setBusy(false);
+        }
     }
     async function decide(id, action) { setQueueBusy(true); setManagerError(''); try { await managerDecide(id, action, notes[id] || ''); await Promise.all([refreshQueue(), refresh()]) } catch (e) { setManagerError(e.message) } finally { setQueueBusy(false) } }
     async function openReceipt(path) { try { window.open(await receiptSignedUrl(path), '_blank', 'noopener,noreferrer') } catch (e) { setManagerError(e.message) } }
@@ -42,7 +118,7 @@ export default function App() {
     return <div className="app-wrap"><div className="phone-app"><div className="statusbar"><span>9:41</span><span className="island" /><span>▮▮ ◕ ▰</span></div><div className="screen" key={page}>
         {page === 'home' && <><div className="home-hero"><div className="home-top"><span className="logo"><ReceiptText size={19} /> ClaimFlow <small>AI Expense Agent</small></span><span className="avatar"><UserRound size={19} /></span></div><h1>Welcome back! 👋</h1><p>Upload receipts. AI handles the details. Your manager handles approval.</p><div className="agent-card"><div className="agent-icon"><Bot size={22} /></div><div><b>Auto-Receipt & Claim Filer</b><p>AI categorization, secure storage and manager approvals.</p></div></div><button className="btn white-btn" onClick={() => go('upload')}><Camera size={17} /> New Expense Claim <ArrowRight size={17} /></button></div><div className="screen-padding"><div className="section-title"><h3>Recent Claims</h3><button onClick={() => go('history')}>View all <ChevronRight size={14} /></button></div>{claims.slice(0, 5).map(c => <div className="task-row" key={c.id}><span className="task-icon green"><FileText size={17} /></span><span><b>{c.title}</b><small>{statusLabel(c.status)} · {c.receipts?.length || 0} receipt(s)</small></span></div>)}{!claims.length && <div className="quiet">No claims yet.</div>}{isManager && <button className="btn primary big" onClick={() => go('manager')}><ShieldCheck size={17} /> Manager Approval Queue <ArrowRight size={17} /></button>}<div className="mini-note"><Info size={16} />{online ? 'Vercel API connected' : 'Vercel API health check unavailable'}</div></div></>}
         {page === 'upload' && <>{head('New Expense Claim', 'Upload receipts and let AI prepare your submission.')}<div className="screen-padding"><div className="panel"><h3>Receipt photos</h3><p className="muted">Up to 5 JPG, PNG or PDF receipts. Camera supported on mobile.</p><div className="upload-zone" onClick={() => fileRef.current?.click()} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); addFiles(e.dataTransfer.files) }}><div className="upload-circle"><Camera size={27} /></div><b>Take a photo or browse files</b><span>Tap to select receipts</span><small>10 MB per file</small></div><input hidden ref={fileRef} type="file" accept="image/jpeg,image/png,application/pdf" multiple onChange={e => { addFiles(e.target.files); e.target.value = '' }} />{files.map((f, i) => <div className="file-row" key={i}><FileText size={18} /><span>{f.name}<small>{Math.round(f.size / 1024)} KB</small></span><button onClick={() => setFiles(old => old.filter((_, j) => j !== i))}><X size={17} /></button></div>)}</div><div className="panel"><h3>AI Instruction</h3><textarea className="prompt" value={prompt} maxLength={1000} rows={4} onChange={e => setPrompt(e.target.value)} /></div>{error && <div className="alert error">{error}</div>}<button className="btn primary big" disabled={!files.length || busy} onClick={process}><Play size={17} /> Save, Process & Submit <ArrowRight size={17} /></button><p className="fineprint">Original photos are saved before Gemini runs. Only your manager can approve a claim.</p></div></>}
-        {page === 'processing' && <div className="dark-screen"><button className="dark-back" onClick={() => go('upload')}><ArrowLeft size={19} /></button><h1>Processing claim</h1><p>ClaimFlow is handling your expense claim.</p><div className="timeline">{[['Save originals', 'Upload to Supabase Storage'], ['AI extraction', 'Read and categorize expenses'], ['Submit to manager', 'Save data and request approval']].map(([t, d], i) => <div className="timeline-item" key={t}><span className="step-bubble current">{i + 1}</span><div><b>{t}</b><small>{d}</small></div></div>)}</div><div className="bot-bubble"><span><Bot size={26} /></span><p>{phase}</p></div>{busy && <div className="spinner"><LoaderCircle size={27} /></div>}{error && <div className="alert error">{error}</div>}{claimId && <p className="fineprint">Saved claim ID: {claimId}</p>}{error && <button className="btn primary big" onClick={() => go('history')}>View Saved Claims</button>}</div>}
+        {page === 'processing' && <div className="dark-screen"><button className="dark-back" onClick={() => go('upload')}><ArrowLeft size={19} /></button><h1>Processing claim</h1><p>ClaimFlow is handling your expense claim.</p><div className="timeline">{[['Save originals', 'Upload to Supabase Storage'], ['AI extraction', 'Read and categorize expenses'], ['Submit to manager', 'Save data and request approval']].map(([t, d], i) => <div className="timeline-item" key={t}><span className="step-bubble current">{i + 1}</span><div><b>{t}</b><small>{d}</small></div></div>)}</div><div className="bot-bubble"><span><Bot size={26} /></span><p>{phase}</p></div>{busy && <div className="spinner"><LoaderCircle size={27} /></div>}{error && <div className="alert error">{error}</div>}{claimId && <p className="fineprint">Saved claim ID: {claimId}</p>}{error && <button className="btn primary big" onClick={() => go('upload')}>Try Again</button>}{error && claimId && <button className="btn secondary big" onClick={() => go('history')}>View Saved Claims</button>}</div>}
         {page === 'results' && <>{head('Extraction Results', `${receipts.length} receipt(s) processed`)}<div className="screen-padding"><div className="metric-grid"><div className="metric green"><strong>{receipts.length - flagged}</strong><span>Checks passed</span></div><div className="metric red"><strong>{flagged}</strong><span>Flagged</span></div><div className="metric"><strong>{money(total)}</strong><span>Claim total</span></div></div><div className="panel"><h3>Manager submission</h3><div className="success-line"><CheckCircle2 size={18} />{statusLabel(claimStatus)}</div><p className="muted">AI validation is not manager approval. Claim ID: {claimId}</p></div><div className="panel no-pad">{receipts.map((r, i) => <button className="receipt-row" key={i} onClick={() => { setSelected(i); go('policy') }}><span className="vendor-icon"><ReceiptText size={16} /></span><span className="vendor-name">{r.merchant}<small>{r.date || 'Date unknown'} · {r.expenseCategory || suggestExpense(r).category}</small></span><b>{money(r.total, r.currency)}</b><span className={`tiny-status ${getIssues(r, receipts, i).length ? 'flag' : 'ok'}`}>{getIssues(r, receipts, i).length ? 'Flagged' : 'Checked'}</span></button>)}</div><button className="btn primary big" onClick={() => go('packet')}>View Claim Summary <ArrowRight size={17} /></button></div></>}
         {page === 'policy' && <>{head('Policy Validation', 'AI checks are advisory. Your manager decides.', 'results')}<div className="screen-padding">{selectedReceipt ? <div className="panel"><h3>{selectedReceipt.merchant}</h3><p>{money(selectedReceipt.total, selectedReceipt.currency)} · {selectedReceipt.date || 'Unknown date'}</p><div className="detail-row"><span>AI expense category</span><b>{selectedReceipt.expenseCategory || suggestExpense(selectedReceipt).category}</b></div>{(selectedReceipt.lineItems || []).map((x, i) => <div className="detail-row" key={i}><span>{x.description}</span><b>{money(x.lineTotal)}</b></div>)}<h4>Policy flags</h4>{getIssues(selectedReceipt, receipts, selected).length ? getIssues(selectedReceipt, receipts, selected).map((x, i) => <div className="alert warn" key={i}><AlertTriangle size={16} />{x}</div>) : <div className="success-line"><CheckCircle2 size={18} /> No automatic flags detected</div>}</div> : <div className="quiet">No receipt selected</div>}<button className="btn primary big" onClick={() => go('results')}>Back to Results</button></div></>}
         {page === 'packet' && <>{head('Claim Summary', 'Manager approval packet', 'results')}<div className="screen-padding"><div className="panel"><h3>Submission status</h3><p><b>{statusLabel(claimStatus || 'draft')}</b></p><p className="muted">Claim ID: {claimId || 'No current claim'}</p><div className="detail-row"><span>Total expense</span><b>{money(total)}</b></div>{receipts.map((r, i) => <div className="detail-row" key={i}><span>{r.merchant}<small>{r.expenseCategory || suggestExpense(r).category}</small></span><b>{money(r.total, r.currency)}</b></div>)}<button className="btn secondary big" disabled={!receipts.length} onClick={() => saveFile('claimflow-claim-summary.json', JSON.stringify({ claimId, status: claimStatus, receipts }, null, 2))}><Download size={17} /> Download Summary</button></div><button className="btn primary big" onClick={() => go('history')}>Track Claim Status <ArrowRight size={17} /></button></div></>}
