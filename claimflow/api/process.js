@@ -35,6 +35,20 @@ function optionalQuantity(value) {
     return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+const INTEGRITY_PREFIX = '[Integrity] ';
+// These flags identify issues requiring human verification, never proof of editing.
+function attachIntegrityObservations(receipt) {
+    const observations = Array.isArray(receipt.integrityObservations) ? receipt.integrityObservations : [];
+    for (const raw of observations.slice(0, 5)) {
+        if (typeof raw !== 'string') continue;
+        const note = raw.trim().slice(0, 240);
+        if (note.length >= 12) receipt.reviewFlags.push(`${INTEGRITY_PREFIX}Visual observation (unverified): ${note}`);
+    }
+    // Keep an advisory record in reviewFlags: existing Supabase RPC persists it
+    // into receipts.confidence_flags for the manager's approval queue.
+    delete receipt.integrityObservations;
+}
+
 function normalizeLineItems(receipt) {
     const lines = [];
     let missingPrices = 0;
@@ -60,7 +74,7 @@ function normalizeLineItems(receipt) {
         const sum = Math.round(lines.reduce((n, item) => n + item.lineTotal, 0) * 100) / 100;
         // Tax/discount/service-charge lines may explain this difference; flag, never invent.
         if (Math.abs(sum - receipt.total) > 0.05) {
-            receipt.reviewFlags.push(`Line-item sum (${sum.toFixed(2)}) differs from receipt total (${receipt.total.toFixed(2)}); check tax, discounts or missing items.`);
+            receipt.reviewFlags.push(`${INTEGRITY_PREFIX}Amount mismatch: printed line items sum to ${sum.toFixed(2)}, receipt total is ${receipt.total.toFixed(2)}. Verify tax, discounts and missing items.`);
         }
     }
 }
@@ -131,7 +145,8 @@ Return ONLY valid JSON in this structure. The example values are TYPES, not actu
           "lineTotal": null
         }
       ],
-      "reviewFlags": []
+      "reviewFlags": [],
+      "integrityObservations": []
     }
   ]
 }
@@ -147,6 +162,14 @@ PRICE EXTRACTION RULES (important):
 - Include taxes, service charges or discounts as separate entries only if explicitly printed as line items.
 - If ANY line item cannot be priced, add a short string to reviewFlags explaining missing prices.
 - If all item amounts are readable but do not add up to the grand total, flag this for review; do not alter values to force a match.
+
+RECEIPT INTEGRITY OBSERVATIONS (advisory, NOT proof of fraud):
+- Return integrityObservations as an array of short strings, empty unless there is a SPECIFIC visible issue.
+- Look for apparent overwritten digits, misaligned amount printing, inconsistent typefaces around amounts, or conflicting totals/receipt numbers.
+- Describe concrete visible evidence, its location and uncertainty. Do not guess a person's intent, accuse the employee, or claim an image is forged.
+- Scans, CamScanner watermarks, compression artifacts, shadows, OCR text, and low image quality ALONE are NOT evidence of fraud; do not flag them as editing.
+- No visible anomaly does NOT prove authenticity. Do not state a receipt is verified genuine.
+- Never add generic speculation (such as 'could have been edited') without visible evidence.
 
 OTHER RULES:
 - Use each original filename exactly once.
@@ -217,6 +240,7 @@ ${String(prompt || '').slice(0, 1000)}
             }
             expected.delete(receipt.sourceFile);
             normalizeLineItems(receipt);
+            attachIntegrityObservations(receipt);
         }
         if (expected.size) return fail(res, 502, 'Some receipts are missing');
 
