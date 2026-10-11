@@ -4,7 +4,13 @@ export const getMemberships = userId => mustQuery(supabase.from('memberships').s
 async function mustQuery(query) { return must(await query); }
 export const getCloudClaims = orgId => mustQuery(supabase.from('claims').select('id,title,status,created_at,submitted_at,decided_at,receipts(id,merchant_name,total,receipt_date,category,original_filename,storage_path,confidence_flags)').eq('organization_id', orgId).order('created_at', { ascending: false }).limit(100));
 export async function createDraft(orgId, userId, files) {
-    const claim = must(await supabase.from('claims').insert({ organization_id: orgId, owner_id: userId, title: `Expense claim · ${new Date().toLocaleDateString('en-MY')}`, status: 'draft' }).select('id').single());
+    const claimId = must(
+        await supabase.rpc('claimflow_create_draft', {
+            p_org_id: orgId
+        })
+    );
+
+    const claim = { id: claimId };
     const uploaded = [];
     try {
         for (const file of files) {
